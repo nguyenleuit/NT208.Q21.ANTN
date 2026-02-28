@@ -147,7 +147,7 @@ Frontend dùng `frontend/.env.local` (không commit).
 
 1) Backend:
 ```bash
-
+cd NT208
 cd backend
 source .venv/bin/activate  # nếu chưa có: python3 -m venv .venv
 # pip install -r requirements.txt
@@ -157,7 +157,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 2) Frontend:
 ```bash
-
+cd NT208
 cd frontend
 npm install
 cp .env.example .env.local

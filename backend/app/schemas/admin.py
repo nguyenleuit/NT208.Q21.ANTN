@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict
 
 from app.models.user import UserRole
 
@@ -10,7 +10,7 @@ class AdminUserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    email: EmailStr
+    email: str
     full_name: str | None
     role: UserRole
     created_at: datetime

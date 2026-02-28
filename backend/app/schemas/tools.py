@@ -10,6 +10,12 @@ class CitationItem(BaseModel):
     citation: str
     status: str
     evidence: str | None = None
+    doi: str | None = None
+    title: str | None = None
+    authors: list[str] = []
+    year: int | None = None
+    source: str | None = None
+    confidence: float = 0.0
 
 
 class CitationReportResponse(BaseModel):
@@ -31,6 +37,12 @@ class JournalItem(BaseModel):
     impact_factor: float | None = None
     publisher: str | None = None
     open_access: bool = False
+    issn: str | None = None
+    h_index: int | None = None
+    review_time_weeks: int | None = None
+    acceptance_rate: float | None = None
+    domains: list[str] = []
+    detected_domains: list[str] = []
 
 
 class JournalMatchResponse(BaseModel):
@@ -51,6 +63,14 @@ class RetractionItem(BaseModel):
     pubpeer_comments: int = 0
     pubpeer_url: str | None = None
     risk_level: str = "UNKNOWN"
+    has_retraction: bool = False
+    has_correction: bool = False
+    has_concern: bool = False
+    is_retracted_openalex: bool = False
+    risk_factors: list[str] = []
+    journal: str | None = None
+    publication_year: int | None = None
+    sources_checked: list[str] = []
 
 
 class RetractionScanResponse(BaseModel):

@@ -194,16 +194,11 @@ class ChatService:
                 "attachment_id": attachment.id,
                 "file_name": attachment.file_name,
                 "mime_type": attachment.mime_type,
-                "storage_url": attachment.storage_url,
+                "size_bytes": attachment.size_bytes,
                 "storage_encrypted": attachment.storage_encrypted,
-                "storage_encryption_alg": attachment.storage_encryption_alg,
             },
         }
-        content = (
-            f"Uploaded file `{attachment.file_name}`. "
-            f"URL: {attachment.storage_url}. "
-            f"Storage encryption: {attachment.storage_encryption_alg}."
-        )
+        content = f"Uploaded file: {attachment.file_name}"
         msg = self._save_message(
             db=db,
             session_id=session_id,

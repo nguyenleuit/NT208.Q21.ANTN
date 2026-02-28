@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     google_api_key: str | None = None
     # Model names are provider-managed and may change. Use ListModels if 404 occurs.
     gemini_model: str = "gemini-flash-latest"
+
+    # Hugging Face token for authenticated model downloads (optional)
+    hf_token: str | None = None
     chat_context_window: int = 8
     system_prompt: str = (
         "You are a professional academic research assistant. "

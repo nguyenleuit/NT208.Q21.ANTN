@@ -1,3 +1,9 @@
+"""
+Gemini LLM Service — uses the **google.genai** SDK exclusively.
+
+The deprecated ``google.generativeai`` package has been removed.
+"""
+
 import logging
 from typing import Sequence
 
@@ -7,46 +13,38 @@ from app.models.chat_message import ChatMessage
 logger = logging.getLogger(__name__)
 
 try:
-    from google import genai as genai_new
-except Exception:  # pragma: no cover - optional dependency runtime issues
-    genai_new = None
-
-try:
-    import google.generativeai as genai_old
-except Exception:  # pragma: no cover - optional dependency runtime issues
-    genai_old = None
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
 
 
 class GeminiService:
+    """Wrapper around Google Gemini via the ``google.genai`` SDK."""
+
     def __init__(self) -> None:
-        self._enabled = bool(settings.google_api_key and (genai_new is not None or genai_old is not None))
-        self._provider = "none"
         self._client = None
-        self._model = None
-        if not self._enabled:
+        if not settings.google_api_key:
+            logger.warning("GOOGLE_API_KEY not set — Gemini disabled.")
             return
-
-        if genai_new is not None:
-            try:
-                self._client = genai_new.Client(api_key=settings.google_api_key)
-                self._provider = "google.genai"
-                return
-            except Exception:
-                self._client = None
-
-        if genai_old is not None:
-            genai_old.configure(api_key=settings.google_api_key)
-            self._model = genai_old.GenerativeModel(
-                model_name=settings.gemini_model,
-                system_instruction=settings.system_prompt,
-            )
-            self._provider = "google.generativeai"
+        if genai is None:
+            logger.warning("google-genai package not installed — Gemini disabled.")
+            return
+        try:
+            self._client = genai.Client(api_key=settings.google_api_key)
+            logger.info("Gemini client initialised (model=%s).", settings.gemini_model)
+        except Exception:
+            logger.exception("Failed to create Gemini client.")
+            self._client = None
 
     @property
     def enabled(self) -> bool:
-        if not self._enabled:
-            return False
-        return self._provider in {"google.genai", "google.generativeai"}
+        return self._client is not None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _build_prompt(self, history: Sequence[ChatMessage], user_text: str) -> str:
         lines: list[str] = ["Conversation context:"]
@@ -59,42 +57,45 @@ class GeminiService:
         lines.append("[ASSISTANT]")
         return "\n".join(lines)
 
+    def _generate(self, prompt: str, system_instruction: str | None = None) -> str | None:
+        """Low-level call to Gemini. Returns text or *None* on failure."""
+        if not self.enabled:
+            return None
+        try:
+            config: dict = {}
+            if system_instruction:
+                config["system_instruction"] = system_instruction
+            result = self._client.models.generate_content(  # type: ignore[union-attr]
+                model=settings.gemini_model,
+                contents=prompt,
+                config=config,
+            )
+            text = getattr(result, "text", "") or ""
+            return text.strip() or None
+        except Exception:
+            logger.exception("Gemini generate_content failed.")
+            return None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def generate_response(self, history: Sequence[ChatMessage], user_text: str) -> str:
         if not self.enabled:
             return (
-                "Gemini is not configured. Please set GOOGLE_API_KEY to enable model responses. "
-                "Current message has been stored successfully."
+                "Gemini is not configured. Please set GOOGLE_API_KEY to enable AI responses. "
+                "Your message has been stored successfully."
             )
 
         prompt = self._build_prompt(history, user_text)
-        if self._provider == "google.genai" and self._client is not None:
-            try:
-                result = self._client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt,
-                    config={"system_instruction": settings.system_prompt},
-                )
-                text = getattr(result, "text", "") or ""
-                if text.strip():
-                    return text.strip()
-            except Exception:
-                # Runtime fallback to legacy SDK
-                logger.warning("Gemini call via google.genai failed; falling back to legacy SDK.", exc_info=True)
-                pass
+        text = self._generate(prompt, settings.system_prompt)
+        if text:
+            return text
 
-        if self._model is not None:
-            try:
-                result = self._model.generate_content(prompt)
-                text = getattr(result, "text", "") or ""
-                return text.strip() or "I could not generate a response for this message."
-            except Exception:
-                logger.warning("Gemini call via google.generativeai failed.", exc_info=True)
-                return (
-                    "Gemini is configured but the request failed (model/key may be invalid). "
-                    "Current message has been stored successfully."
-                )
-
-        return "I could not generate a response for this message."
+        return (
+            "Gemini is configured but the request failed (model/key may be invalid). "
+            "Your message has been stored successfully."
+        )
 
     def summarize_text(self, text: str, max_words: int = 180) -> str:
         prompt = (
@@ -105,31 +106,13 @@ class GeminiService:
         if not self.enabled:
             clipped = " ".join(text.split()[:max_words])
             return f"Tóm tắt (fallback khi Gemini chưa cấu hình): {clipped}"
-        if self._provider == "google.genai" and self._client is not None:
-            try:
-                result = self._client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt,
-                    config={"system_instruction": settings.system_prompt},
-                )
-                out = getattr(result, "text", "") or ""
-                if out.strip():
-                    return out.strip()
-            except Exception:
-                logger.warning("Gemini summarize via google.genai failed; falling back to legacy SDK.", exc_info=True)
-                pass
 
-        if self._model is not None:
-            try:
-                result = self._model.generate_content(prompt)
-                out = getattr(result, "text", "") or ""
-                return out.strip() or "Không thể sinh tóm tắt cho tài liệu này."
-            except Exception:
-                logger.warning("Gemini summarize via google.generativeai failed.", exc_info=True)
-                clipped = " ".join(text.split()[:max_words])
-                return f"Tóm tắt (fallback do Gemini lỗi): {clipped}"
+        result = self._generate(prompt, settings.system_prompt)
+        if result:
+            return result
 
-        return "Không thể sinh tóm tắt cho tài liệu này."
+        clipped = " ".join(text.split()[:max_words])
+        return f"Tóm tắt (fallback do Gemini lỗi): {clipped}"
 
 
 gemini_service = GeminiService()

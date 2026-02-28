@@ -188,29 +188,42 @@ class RetractionScanner:
     # -- PubPeer -----------------------------------------------------------
 
     def _check_pubpeer(self, doi: str) -> PubPeerInfo:
+        """Query PubPeer for community feedback on a DOI.
+
+        NOTE: As of 2026-02, PubPeer's v1 JSON API returns 404 HTML.
+        We still attempt the call but gracefully degrade — the search
+        URL is always populated so users can check PubPeer manually.
+        """
         info = PubPeerInfo()
+        info.url = f"https://pubpeer.com/search?q={doi}"  # always useful
         try:
             resp = self._get_client().get(PUBPEER_API_URL, params={"doi": doi})
-            if resp.status_code == 200:
-                pubs = resp.json().get("publications", [])
-                if pubs:
-                    pub = pubs[0]
-                    info.has_comments = True
-                    info.comment_count = pub.get("total_comments", 0)
-                    info.url = pub.get("url") or f"https://pubpeer.com/search?q={doi}"
-                    comments = pub.get("comments", [])
-                    if comments:
-                        dates = [c.get("created_at") for c in comments if c.get("created_at")]
-                        if dates:
-                            info.latest_comment_date = max(dates)
-                        concern_kws = ["fraud", "fabrication", "manipulation", "duplicate",
-                                       "plagiarism", "misconduct", "retract", "concern",
-                                       "fake", "suspicious", "error"]
-                        for c in comments[:10]:
-                            txt = c.get("body", "").lower()
-                            for kw in concern_kws:
-                                if kw in txt and kw not in info.concerns:
-                                    info.concerns.append(kw)
+            if resp.status_code != 200:
+                logger.debug("PubPeer returned %s for %s (API may be deprecated)", resp.status_code, doi)
+                return info
+            ct = resp.headers.get("content-type", "")
+            if "json" not in ct:
+                logger.debug("PubPeer returned non-JSON (%s) for %s", ct, doi)
+                return info
+            pubs = resp.json().get("publications", [])
+            if pubs:
+                pub = pubs[0]
+                info.has_comments = True
+                info.comment_count = pub.get("total_comments", 0)
+                info.url = pub.get("url") or info.url
+                comments = pub.get("comments", [])
+                if comments:
+                    dates = [c.get("created_at") for c in comments if c.get("created_at")]
+                    if dates:
+                        info.latest_comment_date = max(dates)
+                    concern_kws = ["fraud", "fabrication", "manipulation", "duplicate",
+                                   "plagiarism", "misconduct", "retract", "concern",
+                                   "fake", "suspicious", "error"]
+                    for c in comments[:10]:
+                        txt = c.get("body", "").lower()
+                        for kw in concern_kws:
+                            if kw in txt and kw not in info.concerns:
+                                info.concerns.append(kw)
         except Exception as e:
             logger.debug("PubPeer failed for %s: %s", doi, e)
         return info
@@ -279,6 +292,10 @@ class RetractionScanner:
                     if yp and yp[0]:
                         result.publication_year = yp[0][0]
                         break
+            # Title-based retraction detection: many publishers prefix
+            # the title with "RETRACTED:" even when update-to is absent
+            if result.title and result.title.upper().startswith("RETRACTED"):
+                result.has_retraction = True
 
         # 2. OpenAlex
         is_ret, oa_data = self._check_openalex(doi)

@@ -35,6 +35,24 @@ try:
 except ImportError:
     SentenceTransformer = None  # type: ignore[assignment,misc]
 
+# Authenticate with HF Hub if token is available (prevents rate-limit warnings)
+try:
+    import os as _os
+    # Ensure .env is loaded (pydantic-settings doesn't export to os.environ)
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv()
+    except ImportError:
+        pass
+    _hf_token = _os.environ.get("HF_TOKEN")
+    if _hf_token:
+        _hf_token = _hf_token.strip()  # trim leading/trailing whitespace
+        from huggingface_hub import login as _hf_login
+        _hf_login(token=_hf_token, add_to_git_credential=False)
+        logger.info("Authenticated with Hugging Face Hub.")
+except Exception:
+    pass  # non-critical
+
 TOKEN_RE = re.compile(r"[a-zA-Z]{3,}")
 
 # ---------------------------------------------------------------------------
@@ -348,23 +366,35 @@ class JournalFinder:
         if self._use_ml:
             self._load_model()
 
+    # Model priority: specter2_base (PEFT-free) > scibert > all-MiniLM (lightweight)
+    _MODEL_CANDIDATES = [
+        "allenai/specter2_base",
+        "allenai/scibert_scivocab_uncased",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    ]
+
     def _load_model(self) -> None:
         global _model_cache
         if _model_cache is not None:
             self._model = _model_cache
             self._precompute_journal_embeddings()
             return
-        for name in ("allenai/specter2", "allenai/scibert_scivocab_uncased"):
-            try:
-                logger.info("Loading model %s ...", name)
-                self._model = SentenceTransformer(name)
-                _model_cache = self._model
-                logger.info("Model %s loaded", name)
-                self._precompute_journal_embeddings()
-                return
-            except Exception as exc:
-                logger.warning("Failed to load %s: %s", name, exc)
-        logger.warning("No ML model available - falling back to TF-IDF.")
+        for name in self._MODEL_CANDIDATES:
+            # Try normal load first (may need internet), then local cache only
+            for local_only in (False, True):
+                try:
+                    mode = "local-cache" if local_only else "online"
+                    logger.info("Loading model %s (%s) ...", name, mode)
+                    self._model = SentenceTransformer(
+                        name, trust_remote_code=False, local_files_only=local_only,
+                    )
+                    _model_cache = self._model
+                    logger.info("Model %s loaded successfully (%s).", name, mode)
+                    self._precompute_journal_embeddings()
+                    return
+                except Exception as exc:
+                    logger.warning("Failed to load %s (%s): %s", name, mode, exc)
+        logger.warning("No ML model available — falling back to TF-IDF.")
         self._use_ml = False
 
     def _precompute_journal_embeddings(self) -> None:
