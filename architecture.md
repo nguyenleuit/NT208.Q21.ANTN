@@ -10,10 +10,11 @@
 1. [Sơ đồ Kiến trúc Hệ thống (System Architecture)](#1-sơ-đồ-kiến-trúc-hệ-thống)
 2. [Mô tả Module chính](#2-mô-tả-module-chính)
 3. [Thiết kế Luồng dữ liệu (DFD)](#3-thiết-kế-luồng-dữ-liệu-dfd)
-4. [Sơ đồ UML](#4-sơ-đồ-uml)
-   - 4.1 [Use-case Diagram](#41-use-case-diagram)
-   - 4.2 [Sequence Diagrams](#42-sequence-diagrams)
-5. [Thiết kế Cơ sở dữ liệu (ERD)](#5-thiết-kế-cơ-sở-dữ-liệu-erd)
+4. [Sơ đồ Component — Luồng Upload & Xử lý file PDF](#4-sơ-đồ-component--luồng-upload--xử-lý-file-pdf)
+5. [Sơ đồ UML](#5-sơ-đồ-uml)
+   - 5.1 [Use-case Diagram](#51-use-case-diagram)
+   - 5.2 [Sequence Diagrams](#52-sequence-diagrams)
+6. [Thiết kế Cơ sở dữ liệu (ERD)](#6-thiết-kế-cơ-sở-dữ-liệu-erd)
 
 ---
 
@@ -360,9 +361,562 @@ graph TB
 
 ---
 
-## 4. Sơ đồ UML
+## 4. Sơ đồ Component — Luồng Upload & Xử lý file PDF
 
-### 4.1 Use-case Diagram
+### 4.1 Component Diagram — Tổng quan luồng Upload PDF
+
+```mermaid
+graph TB
+    subgraph FRONTEND["⚛️ Frontend (Next.js)"]
+        direction TB
+        ChatView["ChatView<br/>components/chat-view.tsx"]
+        FileHook["useFileUpload Hook<br/>lib/useFileUpload.ts"]
+        FileInput["&lt;input type=file&gt;<br/>Drag-and-Drop zone"]
+        APIClient["API Client<br/>lib/api.ts"]
+        PdfCard["PdfSummaryCard<br/>components/tool-results.tsx"]
+
+        FileInput -->|"onFileChange()"| FileHook
+        FileHook -->|"validate (type, size)"| FileHook
+        FileHook -->|"api.uploadFile(token, sessionId, file)"| APIClient
+        ChatView -->|"openFilePicker()"| FileInput
+        ChatView -->|"render kết quả"| PdfCard
+    end
+
+    subgraph API_GATEWAY["🔒 API Gateway (FastAPI)"]
+        direction TB
+        UploadEP["POST /api/v1/upload<br/>endpoints/upload.py"]
+        SummarizeEP["POST /api/v1/tools/summarize-pdf<br/>endpoints/tools.py"]
+        DownloadEP["GET /api/v1/upload/{file_id}<br/>endpoints/upload.py"]
+
+        subgraph AUTH["Middleware Chain"]
+            RateLimit["Rate Limiter"]
+            JWT["JWT Verification<br/>(HS256, 1h TTL)"]
+            RBAC["RBAC Check<br/>Permission.FILE_UPLOAD /<br/>Permission.TOOL_EXECUTE"]
+            SessionACL["Session Access Control<br/>ABAC — ownership check"]
+        end
+
+        RateLimit --> JWT --> RBAC --> SessionACL
+    end
+
+    subgraph SERVICES["⚙️ Service Layer"]
+        direction TB
+        FileSvc["FileService<br/>services/file_service.py"]
+        ChatSvc["ChatService<br/>services/chat_service.py"]
+        LLMSvc["GeminiService<br/>services/llm_service.py"]
+
+        subgraph FILE_OPS["FileService Operations"]
+            Validate["validate_mime_type()<br/>sanitize_filename()<br/>_is_pdf_payload()"]
+            ExtractText["extract_pdf_text()<br/>→ PyMuPDF (fitz)"]
+            SaveUpload["save_upload()"]
+            DownloadFile["download_file()"]
+        end
+    end
+
+    subgraph STORAGE_LAYER["📦 Storage Layer"]
+        direction TB
+        StorageSvc["StorageService<br/>services/storage_service.py"]
+
+        subgraph STORAGE_OPS["StorageService Operations"]
+            GenKey["generate_key()<br/>→ {user_id}/{session_id}/{uuid}-{filename}"]
+            Upload["upload(data, key, encrypt=True)"]
+            Download["download(key, decrypt=True)"]
+            Checksum["calculate_checksum()<br/>→ MD5"]
+        end
+
+        subgraph BACKENDS["Storage Backends"]
+            LocalFS["LocalStorage<br/>📂 local_storage/<br/>AES-256-GCM encrypted files"]
+            S3["S3Storage<br/>☁️ AWS S3 bucket<br/>Pre-signed URLs"]
+        end
+
+        StorageSvc --> LocalFS
+        StorageSvc --> S3
+    end
+
+    subgraph CRYPTO_LAYER["🔐 Encryption Layer"]
+        CryptoMgr["CryptoManager<br/>core/crypto.py"]
+
+        subgraph CRYPTO_OPS["AES-256-GCM Operations"]
+            EncBytes["encrypt_bytes(plaintext)<br/>→ random IV(12B) + auth tag(16B)"]
+            DecBytes["decrypt_bytes(token)<br/>→ verify tag + decrypt"]
+            MasterKey["Master Key (32 bytes)<br/>Source: ENV / file / auto-gen"]
+        end
+    end
+
+    subgraph DATABASE["🗄️ Database"]
+        FileTable["file_attachments<br/>(id, session_id, user_id,<br/>file_name, mime_type, size_bytes,<br/>storage_key🔒, storage_url🔒,<br/>extracted_text🔒, created_at)"]
+        MsgTable["chat_messages<br/>(message_type=FILE_UPLOAD /<br/>PDF_SUMMARY)"]
+    end
+
+    subgraph EXTERNAL["🌐 External"]
+        Gemini["Google Gemini API<br/>→ summarize_text()"]
+    end
+
+    %% Upload flow connections
+    APIClient -->|"POST multipart/form-data"| UploadEP
+    UploadEP --> AUTH
+    SessionACL --> FileSvc
+
+    FileSvc --> Validate
+    Validate -->|"bytes payload"| ExtractText
+    FileSvc --> StorageSvc
+    StorageSvc --> GenKey
+    GenKey --> Upload
+    Upload --> CryptoMgr
+    CryptoMgr --> EncBytes
+    EncBytes -->|"encrypted bytes"| LocalFS
+
+    ExtractText -->|"extracted_text"| FileTable
+    SaveUpload -->|"INSERT file_attachments"| FileTable
+    FileSvc -->|"log_file_upload()"| ChatSvc
+    ChatSvc -->|"INSERT message (FILE_UPLOAD)"| MsgTable
+
+    %% Summarize flow
+    APIClient -->|"POST {session_id, file_id}"| SummarizeEP
+    SummarizeEP --> AUTH
+    SessionACL --> FileSvc
+    FileSvc -->|"get_attachment()"| FileTable
+    FileTable -->|"extracted_text (decrypted)"| LLMSvc
+    LLMSvc -->|"summarize_text()"| Gemini
+    Gemini -->|"summary"| LLMSvc
+    LLMSvc -->|"summary text"| SummarizeEP
+    ChatSvc -->|"persist_tool_interaction<br/>(PDF_SUMMARY)"| MsgTable
+
+    %% Download flow
+    APIClient -->|"GET /upload/{file_id}"| DownloadEP
+    DownloadEP --> AUTH
+    SessionACL --> FileSvc
+    FileSvc --> DownloadFile
+    DownloadFile --> StorageSvc
+    StorageSvc --> Download
+    Download --> CryptoMgr
+    CryptoMgr --> DecBytes
+    DecBytes -->|"decrypted bytes"| DownloadEP
+
+    %% Styles
+    classDef frontend fill:#3b82f6,color:#fff,stroke:#1e40af
+    classDef api fill:#f59e0b,color:#fff,stroke:#b45309
+    classDef service fill:#10b981,color:#fff,stroke:#047857
+    classDef storage fill:#ec4899,color:#fff,stroke:#be185d
+    classDef crypto fill:#8b5cf6,color:#fff,stroke:#6d28d9
+    classDef db fill:#06b6d4,color:#fff,stroke:#0e7490
+    classDef external fill:#f97316,color:#fff,stroke:#c2410c
+
+    class ChatView,FileHook,FileInput,APIClient,PdfCard frontend
+    class UploadEP,SummarizeEP,DownloadEP,RateLimit,JWT,RBAC,SessionACL api
+    class FileSvc,ChatSvc,LLMSvc,Validate,ExtractText,SaveUpload,DownloadFile service
+    class StorageSvc,GenKey,Upload,Download,Checksum,LocalFS,S3 storage
+    class CryptoMgr,EncBytes,DecBytes,MasterKey crypto
+    class FileTable,MsgTable db
+    class Gemini external
+```
+
+### 4.2 Component Diagram — Chi tiết xử lý nội bộ FileService
+
+```mermaid
+graph LR
+    subgraph INPUT["📥 Input"]
+        PDF["PDF File<br/>(multipart/form-data)"]
+    end
+
+    subgraph VALIDATION["✅ Stage 1: Validation"]
+        direction TB
+        V1["Check file size<br/>≤ max_upload_size_mb"]
+        V2["Validate MIME type<br/>(allowed_mime_types_list)"]
+        V3["Sanitize filename<br/>regex: [^A-Za-z0-9._-] → _<br/>max 200 chars"]
+        V4["Verify PDF signature<br/>starts with %PDF-"]
+        V1 --> V2 --> V3 --> V4
+    end
+
+    subgraph ENCRYPTION["🔐 Stage 2: Encryption"]
+        direction TB
+        E1["Generate storage key<br/>{user_id}/{session_id}/{uuid8}-{name}"]
+        E2["AES-256-GCM encrypt<br/>random IV (12 bytes)<br/>+ auth tag (16 bytes)"]
+        E3["Base64 encode<br/>→ encrypted payload"]
+        E1 --> E2 --> E3
+    end
+
+    subgraph STORAGE["💾 Stage 3: Storage"]
+        direction TB
+        S1{"storage_type?"}
+        S2["LocalStorage<br/>write to local_storage/"]
+        S3["S3Storage<br/>PutObject to bucket"]
+        S1 -->|"LOCAL"| S2
+        S1 -->|"S3"| S3
+    end
+
+    subgraph EXTRACT["📄 Stage 4: Text Extraction"]
+        direction TB
+        X1{"mime_type ==<br/>application/pdf?"}
+        X2["PyMuPDF (fitz)<br/>fitz.open(stream=BytesIO)"]
+        X3["Iterate pages<br/>page.get_text('text')"]
+        X4["Join all pages<br/>→ extracted_text"]
+        X5["Skip<br/>(extracted_text = null)"]
+        X1 -->|"Yes"| X2 --> X3 --> X4
+        X1 -->|"No"| X5
+    end
+
+    subgraph PERSIST["🗄️ Stage 5: Persist"]
+        direction TB
+        P1["INSERT file_attachments<br/>(encrypted fields:<br/>storage_key, storage_url,<br/>extracted_text)"]
+        P2["INSERT chat_messages<br/>(type=FILE_UPLOAD,<br/>role=SYSTEM)"]
+        P3["Audit log<br/>event=file.upload"]
+        P1 --> P2 --> P3
+    end
+
+    subgraph OUTPUT["📤 Output"]
+        Resp["FileUploadResponse<br/>{id, file_name, mime_type,<br/>size_bytes, created_at}"]
+    end
+
+    PDF --> VALIDATION
+    VALIDATION --> ENCRYPTION
+    ENCRYPTION --> STORAGE
+    VALIDATION --> EXTRACT
+    STORAGE --> PERSIST
+    EXTRACT --> PERSIST
+    PERSIST --> Resp
+
+    classDef stage fill:#1e293b,color:#e2e8f0,stroke:#334155
+    classDef input fill:#3b82f6,color:#fff,stroke:#1e40af
+    classDef output fill:#10b981,color:#fff,stroke:#047857
+    classDef decision fill:#f59e0b,color:#000,stroke:#b45309
+
+    class V1,V2,V3,V4,E1,E2,E3,S2,S3,X2,X3,X4,X5,P1,P2,P3 stage
+    class PDF input
+    class Resp output
+    class S1,X1 decision
+```
+
+### 4.3 Component Diagram — Luồng Tóm tắt PDF (Summarize)
+
+```mermaid
+graph LR
+    subgraph TRIGGER["🖱️ Trigger"]
+        User["User click<br/>'Tóm tắt PDF'"]
+    end
+
+    subgraph FRONTEND_FLOW["⚛️ Frontend"]
+        FE1["ChatView<br/>→ POST /tools/summarize-pdf<br/>{session_id, file_id}"]
+    end
+
+    subgraph BACKEND_FLOW["🐍 Backend Processing"]
+        direction TB
+        T1["ToolsEndpoint<br/>summarize_pdf()"]
+        T2["FileService<br/>get_attachment(db, user,<br/>session_id, file_id)"]
+        T3{"extracted_text<br/>exists?"}
+        T4["GeminiService<br/>summarize_text(extracted_text)"]
+        T5["Return error msg<br/>'Không có nội dung text<br/>để tóm tắt'"]
+        T6["ChatService<br/>persist_tool_interaction()<br/>type=PDF_SUMMARY"]
+
+        T1 --> T2 --> T3
+        T3 -->|"Yes"| T4
+        T3 -->|"No (scanned PDF)"| T5
+        T4 --> T6
+    end
+
+    subgraph DB_LAYER["🗄️ Database"]
+        DB1["file_attachments<br/>→ decrypt extracted_text<br/>(AES-256-GCM)"]
+        DB2["chat_messages<br/>INSERT (role=ASSISTANT,<br/>type=PDF_SUMMARY)"]
+    end
+
+    subgraph GEMINI["🤖 Google Gemini"]
+        GEM["models.generate_content()<br/>model: gemini-flash-latest<br/>→ summary text"]
+    end
+
+    subgraph RENDER["🎨 Frontend Render"]
+        Card["PdfSummaryCard<br/>📄 file_name<br/>📝 summary text"]
+    end
+
+    User --> FE1
+    FE1 --> T1
+    T2 --> DB1
+    DB1 -->|"decrypted text"| T3
+    T4 --> GEM
+    GEM -->|"summary"| T4
+    T6 --> DB2
+    T5 --> RENDER
+    T6 -->|"PdfSummaryResponse"| RENDER
+
+    classDef trigger fill:#f97316,color:#fff,stroke:#c2410c
+    classDef frontend fill:#3b82f6,color:#fff,stroke:#1e40af
+    classDef backend fill:#10b981,color:#fff,stroke:#047857
+    classDef db fill:#06b6d4,color:#fff,stroke:#0e7490
+    classDef gemini fill:#8b5cf6,color:#fff,stroke:#6d28d9
+    classDef render fill:#ec4899,color:#fff,stroke:#be185d
+    classDef decision fill:#f59e0b,color:#000,stroke:#b45309
+
+    class User trigger
+    class FE1 frontend
+    class T1,T2,T4,T5,T6 backend
+    class DB1,DB2 db
+    class GEM gemini
+    class Card render
+    class T3 decision
+```
+
+### 4.4 Component Diagram — Luồng Retraction Scan
+
+#### 4.4.1 Tổng quan luồng Retraction Scan
+
+```mermaid
+graph TB
+    subgraph FRONTEND["⚛️ Frontend (Next.js)"]
+        direction TB
+        ChatView["ChatView<br/>components/chat-view.tsx"]
+        APIClient["API Client<br/>lib/api.ts"]
+        RetractCard["RetractionReportCard<br/>components/tool-results.tsx"]
+
+        ChatView -->|"user nhập text chứa DOIs"| APIClient
+        ChatView -->|"render kết quả"| RetractCard
+    end
+
+    subgraph API_GATEWAY["🔒 API Gateway (FastAPI)"]
+        direction TB
+        RetractEP["POST /api/v1/tools/retraction-scan<br/>endpoints/tools.py"]
+
+        subgraph AUTH["Middleware Chain"]
+            RateLimit["Rate Limiter"]
+            JWT["JWT Verification<br/>(HS256, 1h TTL)"]
+            RBAC["RBAC Check<br/>Permission.TOOL_EXECUTE"]
+        end
+
+        RateLimit --> JWT --> RBAC
+    end
+
+    subgraph SCANNER["🔍 RetractionScanner<br/>services/tools/retraction_scan.py"]
+        direction TB
+        ExtractDOI["extract_doi(text)<br/>regex: 10.XXXX/... (case-insensitive)<br/>→ sorted unique DOI list"]
+
+        subgraph SCAN_DOI["scan_doi(doi) — per DOI"]
+            direction TB
+
+            subgraph SRC1["Source 1: Crossref"]
+                CR_Hab["Habanero SDK<br/>cr.works(ids=doi)"]
+                CR_HTTP["httpx fallback<br/>GET /works/{doi}"]
+                CR_Parse["Parse metadata:<br/>• title, journal, authors, year<br/>• update-to → retraction/concern/correction<br/>• Title prefix: RETRACTED:"]
+                CR_Hab -->|"fail"| CR_HTTP
+                CR_Hab -->|"success"| CR_Parse
+                CR_HTTP --> CR_Parse
+            end
+
+            subgraph SRC2["Source 2: OpenAlex"]
+                OA_Query["httpx GET<br/>api.openalex.org/works<br/>?filter=doi:{doi}"]
+                OA_Parse["Parse response:<br/>• is_retracted (bool)<br/>• display_name, publication_year<br/>• openalex_id"]
+                OA_Query --> OA_Parse
+            end
+
+            subgraph SRC3["Source 3: PubPeer"]
+                PP_Query["httpx GET<br/>pubpeer.com/v1/publications<br/>?doi={doi}"]
+                PP_Check{"HTTP 200<br/>+ JSON?"}
+                PP_Parse["Parse comments:<br/>• comment_count<br/>• latest_comment_date<br/>• concerns (keyword scan)"]
+                PP_Dead["⚠️ API Dead (404/HTML)<br/>→ graceful fallback<br/>pubpeer_comments = 0"]
+                PP_URL["Always set:<br/>pubpeer.com/search?q={doi}"]
+                PP_Query --> PP_Check
+                PP_Check -->|"Yes"| PP_Parse
+                PP_Check -->|"No"| PP_Dead
+                PP_Parse --> PP_URL
+                PP_Dead --> PP_URL
+            end
+
+            subgraph RISK_CALC["Risk Calculation"]
+                CalcRisk["_calculate_risk()"]
+                R_CRIT["🔴 CRITICAL<br/>has_retraction=True OR<br/>is_retracted_openalex=True OR<br/>Crossref: retraction/withdrawal"]
+                R_HIGH["🟠 HIGH<br/>Expression of Concern OR<br/>PubPeer ≥ 5 comments"]
+                R_MED["🟡 MEDIUM<br/>has_correction OR<br/>PubPeer ≥ 2 comments"]
+                R_LOW["🟢 LOW<br/>PubPeer ≥ 1 comment"]
+                R_NONE["⚪ NONE<br/>No issues found"]
+                CalcRisk --> R_CRIT
+                CalcRisk --> R_HIGH
+                CalcRisk --> R_MED
+                CalcRisk --> R_LOW
+                CalcRisk --> R_NONE
+            end
+
+            subgraph STATUS_DECIDE["Status Decision"]
+                StatusLogic["Determine status:<br/>RETRACTED → CONCERN →<br/>CORRECTED → ACTIVE → UNKNOWN"]
+            end
+        end
+
+        ScanBatch["scan(text) — batch<br/>Loop all DOIs → scan_doi()"]
+        Summary["get_summary()<br/>Count: retracted, concerns,<br/>corrected, active, unknown,<br/>critical_risk, high_risk,<br/>pubpeer_discussions"]
+    end
+
+    subgraph ENDPOINT_LOGIC["📊 Endpoint Processing<br/>tools.py → retraction_scan()"]
+        Convert["Convert RetractionResult<br/>→ RetractionItem (Pydantic)<br/>via asdict() + model_dump()"]
+        GenSummary["Generate summary text:<br/>• Retracted count<br/>• High risk count<br/>• PubPeer discussions"]
+        Persist["ChatService<br/>persist_tool_interaction()<br/>type=RETRACTION_REPORT"]
+    end
+
+    subgraph DATABASE["🗄️ Database"]
+        MsgTable["chat_messages<br/>(role=ASSISTANT,<br/>type=RETRACTION_REPORT,<br/>tool_results🔒)"]
+    end
+
+    subgraph EXTERNAL["🌐 External APIs"]
+        CrossrefAPI["Crossref API<br/>api.crossref.org/works"]
+        OpenAlexAPI["OpenAlex API<br/>api.openalex.org/works"]
+        PubPeerAPI["PubPeer API<br/>pubpeer.com/v1<br/>(⚠️ dead since 2026-02)"]
+    end
+
+    %% Main flow
+    APIClient -->|"POST {session_id, text}"| RetractEP
+    RetractEP --> AUTH
+    RBAC --> ExtractDOI
+    ExtractDOI --> ScanBatch
+
+    ScanBatch -->|"for each DOI"| SRC1
+    ScanBatch -->|"for each DOI"| SRC2
+    ScanBatch -->|"for each DOI"| SRC3
+
+    CR_Hab -->|"SDK call"| CrossrefAPI
+    CR_HTTP -->|"HTTP GET"| CrossrefAPI
+    OA_Query -->|"HTTP GET"| OpenAlexAPI
+    PP_Query -->|"HTTP GET"| PubPeerAPI
+
+    SRC1 --> RISK_CALC
+    SRC2 --> RISK_CALC
+    SRC3 --> RISK_CALC
+    RISK_CALC --> STATUS_DECIDE
+
+    ScanBatch --> Summary
+    Summary --> Convert
+    Convert --> GenSummary
+    GenSummary --> Persist
+    Persist -->|"INSERT message"| MsgTable
+
+    GenSummary -->|"RetractionScanResponse<br/>{data: [...], text: summary}"| RetractEP
+    RetractEP -->|"JSON response"| APIClient
+    APIClient --> RetractCard
+
+    %% Styles
+    classDef frontend fill:#3b82f6,color:#fff,stroke:#1e40af
+    classDef api fill:#f59e0b,color:#fff,stroke:#b45309
+    classDef scanner fill:#10b981,color:#fff,stroke:#047857
+    classDef source fill:#6366f1,color:#fff,stroke:#4338ca
+    classDef risk fill:#ef4444,color:#fff,stroke:#b91c1c
+    classDef db fill:#06b6d4,color:#fff,stroke:#0e7490
+    classDef external fill:#8b5cf6,color:#fff,stroke:#6d28d9
+    classDef endpoint fill:#14b8a6,color:#fff,stroke:#0d9488
+    classDef dead fill:#6b7280,color:#fff,stroke:#4b5563
+
+    class ChatView,APIClient,RetractCard frontend
+    class RetractEP,RateLimit,JWT,RBAC api
+    class ExtractDOI,ScanBatch,Summary scanner
+    class CR_Hab,CR_HTTP,CR_Parse,OA_Query,OA_Parse,PP_Query,PP_Parse,PP_URL source
+    class CalcRisk,R_CRIT,R_HIGH,R_MED,R_LOW,R_NONE,StatusLogic risk
+    class MsgTable db
+    class CrossrefAPI,OpenAlexAPI external
+    class PubPeerAPI,PP_Dead,PP_Check dead
+    class Convert,GenSummary,Persist endpoint
+```
+
+#### 4.4.2 Chi tiết xử lý nội bộ scan_doi()
+
+```mermaid
+graph LR
+    subgraph INPUT["📥 Input"]
+        DOI["Single DOI<br/>e.g. 10.1016/S0140-6736(97)11096-0"]
+    end
+
+    subgraph CROSSREF["🔵 Stage 1: Crossref Query"]
+        direction TB
+        C1{"Habanero<br/>available?"}
+        C2["cr.works(ids=doi)<br/>→ message.update-to"]
+        C3["httpx GET<br/>/works/{doi}<br/>(retries=2, timeout=12s)"]
+        C4["Parse metadata:<br/>• title (first element)<br/>• container-title → journal<br/>• author[:5] → authors<br/>• published-print/online → year"]
+        C5["Parse update-to[]:<br/>retraction → has_retraction<br/>expression-of-concern → has_concern<br/>correction/erratum → has_correction"]
+        C6["Title check:<br/>startswith('RETRACTED:')"]
+        C1 -->|"Yes"| C2
+        C1 -->|"No"| C3
+        C2 --> C4
+        C3 --> C4
+        C4 --> C5
+        C5 --> C6
+    end
+
+    subgraph OPENALEX["🟢 Stage 2: OpenAlex Query"]
+        direction TB
+        O1["httpx GET<br/>api.openalex.org/works<br/>?filter=doi:{doi}"]
+        O2["Parse response:<br/>• is_retracted (bool)<br/>• display_name → title fallback<br/>• publication_year fallback<br/>• id → openalex_id"]
+        O1 --> O2
+    end
+
+    subgraph PUBPEER["🟠 Stage 3: PubPeer Query"]
+        direction TB
+        P1["httpx GET<br/>pubpeer.com/v1/publications<br/>?doi={doi}"]
+        P2{"status=200<br/>+ JSON?"}
+        P3["Parse:<br/>• total_comments<br/>• latest_comment_date<br/>• Keyword scan (11 terms):<br/>fraud, fabrication,<br/>manipulation, duplicate,<br/>plagiarism, misconduct..."]
+        P4["Fallback:<br/>comments=0<br/>url=pubpeer.com/search?q={doi}"]
+        P1 --> P2
+        P2 -->|"Yes"| P3
+        P2 -->|"No (404/HTML)"| P4
+    end
+
+    subgraph RISK["⚖️ Stage 4: Risk Assessment"]
+        direction TB
+        R1["Collect all signals"]
+        R2{"has_retraction<br/>OR is_retracted_openalex<br/>OR update-to: retraction?"}
+        R3["🔴 CRITICAL"]
+        R4{"has_concern<br/>OR PubPeer ≥ 5?"}
+        R5["🟠 HIGH"]
+        R6{"has_correction<br/>OR PubPeer ≥ 2?"}
+        R7["🟡 MEDIUM"]
+        R8{"PubPeer ≥ 1?"}
+        R9["🟢 LOW"]
+        R10["⚪ NONE"]
+
+        R1 --> R2
+        R2 -->|"Yes"| R3
+        R2 -->|"No"| R4
+        R4 -->|"Yes"| R5
+        R4 -->|"No"| R6
+        R6 -->|"Yes"| R7
+        R6 -->|"No"| R8
+        R8 -->|"Yes"| R9
+        R8 -->|"No"| R10
+    end
+
+    subgraph OUTPUT["📤 Output"]
+        Result["RetractionResult<br/>{doi, status, title, journal,<br/>risk_level, risk_factors[],<br/>pubpeer_comments, pubpeer_url,<br/>sources_checked[],<br/>has_retraction, has_concern,<br/>is_retracted_openalex,<br/>publication_year, authors[]}"]
+    end
+
+    DOI --> CROSSREF
+    DOI --> OPENALEX
+    DOI --> PUBPEER
+    CROSSREF --> RISK
+    OPENALEX --> RISK
+    PUBPEER --> RISK
+    RISK --> OUTPUT
+
+    classDef input fill:#3b82f6,color:#fff,stroke:#1e40af
+    classDef crossref fill:#1e293b,color:#e2e8f0,stroke:#334155
+    classDef openalex fill:#1e293b,color:#e2e8f0,stroke:#334155
+    classDef pubpeer fill:#6b7280,color:#fff,stroke:#4b5563
+    classDef risk fill:#7c3aed,color:#fff,stroke:#5b21b6
+    classDef output fill:#10b981,color:#fff,stroke:#047857
+    classDef decision fill:#f59e0b,color:#000,stroke:#b45309
+    classDef critical fill:#ef4444,color:#fff,stroke:#b91c1c
+    classDef high fill:#f97316,color:#fff,stroke:#c2410c
+    classDef medium fill:#eab308,color:#000,stroke:#a16207
+    classDef low fill:#22c55e,color:#fff,stroke:#15803d
+    classDef none fill:#e5e7eb,color:#374151,stroke:#9ca3af
+
+    class DOI input
+    class C1,C2,C3,C4,C5,C6 crossref
+    class O1,O2 openalex
+    class P1,P2,P3,P4 pubpeer
+    class R1,R2,R4,R6,R8 decision
+    class R3 critical
+    class R5 high
+    class R7 medium
+    class R9 low
+    class R10 none
+    class Result output
+```
+
+---
+
+## 5. Sơ đồ UML
+
+### 5.1 Use-case Diagram
 
 ```mermaid
 graph TB
@@ -433,9 +987,9 @@ graph TB
     UC12 -->|"include"| UC13
 ```
 
-### 4.2 Sequence Diagrams
+### 5.2 Sequence Diagrams
 
-#### 4.2.1 Sequence Diagram — Đăng nhập & Xác thực
+#### 5.2.1 Sequence Diagram — Đăng nhập & Xác thực
 
 ```mermaid
 sequenceDiagram
@@ -463,7 +1017,7 @@ sequenceDiagram
     FE-->>User: Redirect → /chat
 ```
 
-#### 4.2.2 Sequence Diagram — Chat AI (General QA Mode)
+#### 5.2.2 Sequence Diagram — Chat AI (General QA Mode)
 
 ```mermaid
 sequenceDiagram
@@ -504,7 +1058,7 @@ sequenceDiagram
     FE-->>User: Hiển thị AI response
 ```
 
-#### 4.2.3 Sequence Diagram — Citation Verification Tool
+#### 5.2.3 Sequence Diagram — Citation Verification Tool
 
 ```mermaid
 sequenceDiagram
@@ -551,7 +1105,7 @@ sequenceDiagram
     FE-->>User: Hiển thị kết quả
 ```
 
-#### 4.2.4 Sequence Diagram — Journal Recommendation Tool
+#### 5.2.4 Sequence Diagram — Journal Recommendation Tool
 
 ```mermaid
 sequenceDiagram
@@ -586,7 +1140,7 @@ sequenceDiagram
     FE-->>User: Hiển thị danh sách tạp chí
 ```
 
-#### 4.2.5 Sequence Diagram — File Upload & PDF Summary
+#### 5.2.5 Sequence Diagram — File Upload & PDF Summary
 
 ```mermaid
 sequenceDiagram
@@ -630,7 +1184,7 @@ sequenceDiagram
     FE-->>User: Hiển thị bản tóm tắt PDF
 ```
 
-#### 4.2.6 Sequence Diagram — Retraction Scan
+#### 5.2.6 Sequence Diagram — Retraction Scan
 
 ```mermaid
 sequenceDiagram
@@ -676,9 +1230,9 @@ sequenceDiagram
 
 ---
 
-## 5. Thiết kế Cơ sở dữ liệu (ERD)
+## 6. Thiết kế Cơ sở dữ liệu (ERD)
 
-### 5.1 Lược đồ Quan hệ Thực thể (Entity Relationship Diagram)
+### 6.1 Lược đồ Quan hệ Thực thể (Entity Relationship Diagram)
 
 ```mermaid
 erDiagram
@@ -733,7 +1287,7 @@ erDiagram
     users ||--o{ file_attachments : "1 user → N files"
 ```
 
-### 5.2 Chi tiết Bảng & Ràng buộc
+### 6.2 Chi tiết Bảng & Ràng buộc
 
 #### Bảng `users`
 
@@ -793,7 +1347,7 @@ erDiagram
 - `ix_fileatt_session_created(session_id, created_at)` — truy vấn files theo session
 - `ix_fileatt_user_created(user_id, created_at)` — truy vấn files theo user
 
-### 5.3 Mối quan hệ (Relationships)
+### 6.3 Mối quan hệ (Relationships)
 
 | Quan hệ | Loại | ON DELETE | Mô tả |
 |----------|------|-----------|-------|
@@ -803,7 +1357,7 @@ erDiagram
 | `chat_messages` → `file_attachments` | 1:N | SET NULL | Xóa message → giữ file, set message_id = NULL |
 | `users` → `file_attachments` | 1:N | CASCADE | Xóa user → xóa tất cả files |
 
-### 5.4 Encryption Schema
+### 6.4 Encryption Schema
 
 Các cột được đánh dấu `EncryptedText` / `EncryptedJSON` sử dụng SQLAlchemy custom types trong `core/encrypted_types.py`:
 
@@ -820,7 +1374,7 @@ DB read → Base64 decode → AES-256-GCM decrypt(master_key, iv, tag) → Plain
 | `file_attachments` | `storage_url` | EncryptedText |
 | `file_attachments` | `extracted_text` | EncryptedText |
 
-### 5.5 Sample Data (JSON Demo)
+### 6.5 Sample Data (JSON Demo)
 
 #### User record
 ```json
@@ -876,6 +1430,669 @@ DB read → Base64 decode → AES-256-GCM decrypt(master_key, iv, tag) → Plain
   "extracted_text": "ENC:AES256GCM:base64(Introduction: This paper presents...)...",
   "created_at": "2026-02-28T10:08:00+00:00"
 }
+```
+
+---
+
+## 7. Tích hợp API & Dịch vụ bên ngoài (API Integrations & Third-Party Services)
+
+Phần này mô tả chi tiết tất cả các tích hợp với dịch vụ/API bên ngoài mà hệ thống AIRA sử dụng, bao gồm: vai trò, phương thức tích hợp, cơ chế fallback, và trạng thái hiện tại.
+
+### 7.1 Tổng quan Integrations
+
+```mermaid
+graph TB
+    subgraph AIRA["🏗️ AIRA Backend"]
+        LLM["LLM Service<br/>(GeminiService)"]
+        CC["Citation Checker"]
+        JF["Journal Finder"]
+        RS["Retraction Scanner"]
+        AW["AI Writing Detector"]
+        FS["File Service"]
+        SS["Storage Service"]
+        AUTH["Auth Service"]
+    end
+
+    subgraph External_APIs["🌐 External APIs"]
+        GEMINI["Google Gemini API<br/>gemini-2.0-flash"]
+        OA["OpenAlex API<br/>api.openalex.org"]
+        CR["Crossref API<br/>api.crossref.org"]
+        PP["PubPeer API<br/>pubpeer.com ❌ DEAD"]
+    end
+
+    subgraph ML_Models["🧠 ML Models (HuggingFace)"]
+        SP["SPECTER2<br/>allenai/specter2_base"]
+        RB["RoBERTa<br/>roberta-base-openai-detector"]
+        HF["HuggingFace Hub<br/>Model Downloads"]
+    end
+
+    subgraph Infrastructure["⚙️ Infrastructure"]
+        DB["SQLAlchemy<br/>SQLite / PostgreSQL"]
+        S3["AWS S3<br/>boto3"]
+        CRYPTO["PyCryptodome<br/>AES-256-GCM"]
+        JWT_LIB["python-jose<br/>JWT HS256"]
+        BCRYPT["bcrypt<br/>Password Hashing"]
+    end
+
+    subgraph Document["📄 Document Processing"]
+        PDF["PyMuPDF (fitz)<br/>PDF Text Extraction"]
+    end
+
+    LLM -->|google-genai SDK| GEMINI
+    CC -->|pyalex SDK| OA
+    CC -->|habanero SDK| CR
+    RS -->|habanero SDK| CR
+    RS -->|httpx| OA
+    RS -->|httpx ❌| PP
+    JF -->|sentence-transformers| SP
+    JF -->|huggingface-hub| HF
+    AW -->|transformers| RB
+    FS --> PDF
+    SS --> S3
+    AUTH --> JWT_LIB
+    AUTH --> BCRYPT
+
+    classDef dead fill:#ff6b6b,stroke:#c0392b,color:#fff
+    classDef ok fill:#2ecc71,stroke:#27ae60,color:#fff
+    classDef warn fill:#f39c12,stroke:#e67e22,color:#fff
+    classDef ml fill:#9b59b6,stroke:#8e44ad,color:#fff
+
+    class PP dead
+    class GEMINI,OA,CR ok
+    class SP,RB,HF ml
+    class DB,S3,CRYPTO,JWT_LIB,BCRYPT,PDF ok
+```
+
+### 7.2 Google Gemini API
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | LLM chính — tạo phản hồi chat, tóm tắt PDF, hỗ trợ viết bài |
+| **SDK** | `google-genai` ≥ 1.0.0 (phiên bản mới, thay thế deprecated `google-generativeai`) |
+| **Model** | `gemini-2.0-flash` (cấu hình qua `settings.gemini_model`) |
+| **Auth** | API Key qua biến môi trường `GOOGLE_API_KEY` |
+| **File** | `backend/app/services/llm_service.py` |
+| **Trạng thái** | ✅ Hoạt động (429 khi hết quota — hành vi bình thường) |
+
+**Phương thức tích hợp:**
+
+```python
+from google import genai
+from google.genai import types as genai_types
+
+# Khởi tạo client
+client = genai.Client(api_key=settings.google_api_key)
+
+# Gọi API
+response = client.models.generate_content(
+    model=settings.gemini_model,  # "gemini-2.0-flash"
+    contents=prompt,
+    config=genai_types.GenerateContentConfig(
+        temperature=0.7,
+        max_output_tokens=2048,
+    ),
+)
+```
+
+**Cơ chế Fallback:**
+- Nếu `GOOGLE_API_KEY` không được set → log warning, disable Gemini, trả message mặc định
+- Nếu SDK `google-genai` không cài → disable Gemini
+- Nếu API call thất bại (network, quota) → trả message lỗi thân thiện, KHÔNG crash
+- `summarize_text()` fallback: cắt 500 ký tự đầu kèm `[...]` khi Gemini disabled
+
+```mermaid
+flowchart TD
+    A[User gửi message] --> B{GOOGLE_API_KEY<br/>có set?}
+    B -->|Không| C[Return message mặc định:<br/>'Gemini is not configured...']
+    B -->|Có| D{google-genai<br/>installed?}
+    D -->|Không| C
+    D -->|Có| E[genai.Client.models.generate_content]
+    E -->|Success| F[Return AI response]
+    E -->|Error 429| G[Return: 'Quota exceeded...']
+    E -->|Network Error| H[Return: 'Xin lỗi, tôi chưa thể trả lời...']
+
+    style C fill:#f39c12,stroke:#e67e22
+    style G fill:#ff6b6b,stroke:#c0392b
+    style H fill:#ff6b6b,stroke:#c0392b
+    style F fill:#2ecc71,stroke:#27ae60
+```
+
+### 7.3 OpenAlex API
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Cơ sở dữ liệu học thuật mở — xác minh citation, kiểm tra retraction status |
+| **SDK chính** | `pyalex` ≥ 0.13 (Python wrapper cho OpenAlex REST API) |
+| **HTTP fallback** | `httpx` gọi trực tiếp `https://api.openalex.org/works` |
+| **Auth** | Không yêu cầu (public API, polite pool qua email) |
+| **Base URL** | `https://api.openalex.org` |
+| **Sử dụng bởi** | `citation_checker.py`, `retraction_scan.py` |
+| **Trạng thái** | ✅ Hoạt động (latency ~2.0s, 2.6M+ works indexed) |
+
+**Phương thức tích hợp — Citation Checker:**
+
+```python
+# Cách 1: PyAlex SDK (ưu tiên)
+from pyalex import Works
+
+works = Works().search(title_query).get(per_page=5)
+for work in works:
+    # work["doi"], work["title"], work["authorships"]
+
+# Cách 2: httpx fallback (khi PyAlex fail)
+import httpx
+r = httpx.get(
+    "https://api.openalex.org/works",
+    params={"search": title_query, "per_page": 5},
+    timeout=10.0,
+)
+data = r.json()["results"]
+```
+
+**Phương thức tích hợp — Retraction Scanner:**
+
+```python
+# Kiểm tra retraction status qua OpenAlex
+import httpx
+r = httpx.get(
+    f"https://api.openalex.org/works/https://doi.org/{doi}",
+    timeout=12.0,
+)
+work = r.json()
+is_retracted = work.get("is_retracted", False)
+```
+
+**Cơ chế Fallback:**
+- PyAlex SDK failure → chuyển sang httpx HTTP trực tiếp
+- httpx failure → trả `UNVERIFIED` status, không crash
+- `httpx.Client(timeout=10.0)` với transport `retries=2`
+
+### 7.4 Crossref API
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Metadata DOI — xác minh citation qua DOI, kiểm tra retraction/correction |
+| **SDK chính** | `habanero` ≥ 1.2.0 (Python wrapper cho Crossref REST API) |
+| **HTTP fallback** | `httpx` gọi trực tiếp `https://api.crossref.org/works/{doi}` |
+| **Auth** | Không yêu cầu (public API, polite pool qua `mailto`) |
+| **Base URL** | `https://api.crossref.org` |
+| **Sử dụng bởi** | `citation_checker.py`, `retraction_scan.py` |
+| **Trạng thái** | ✅ Hoạt động (latency ~1.0s) |
+
+**Phương thức tích hợp — Citation Checker (DOI verification):**
+
+```python
+# Cách 1: Habanero SDK (ưu tiên)
+from habanero import Crossref
+cr = Crossref()
+result = cr.works(ids=doi)
+metadata = result["message"]
+# metadata["title"], metadata["author"], metadata["DOI"]
+
+# Cách 2: httpx fallback
+import httpx
+r = httpx.get(f"https://api.crossref.org/works/{doi}", timeout=10.0)
+metadata = r.json()["message"]
+```
+
+**Phương thức tích hợp — Retraction Scanner (update-to check):**
+
+```python
+from habanero import Crossref
+cr = Crossref()
+result = cr.works(ids=doi)
+msg = result["message"]
+
+# Kiểm tra retraction/correction qua "update-to" field
+for update in msg.get("update-to", []):
+    if update.get("type") == "retraction":
+        # Paper đã bị retract
+    elif update.get("type") == "correction":
+        # Paper có correction
+
+# Fallback: kiểm tra title prefix "RETRACTED:"
+title = msg.get("title", [""])[0]
+if title.upper().startswith("RETRACTED:"):
+    # Paper đã bị retract (phát hiện qua title)
+```
+
+**Cơ chế Fallback:**
+- Habanero SDK failure → chuyển sang httpx HTTP trực tiếp
+- httpx failure → trả `UNVERIFIED`, không crash
+- `httpx.HTTPTransport(retries=2)` cho reliability
+- Crossref `update-to` field không đáng tin (rỗng cho nhiều paper đã retract) → bổ sung title-based detection
+
+### 7.5 PubPeer API
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Kiểm tra post-publication peer review comments |
+| **HTTP Client** | `httpx` gọi `https://pubpeer.com/v1/publications` |
+| **Auth** | Không yêu cầu |
+| **Sử dụng bởi** | `retraction_scan.py` |
+| **Trạng thái** | ❌ **DEAD** — Tất cả endpoints trả 404 HTML thay vì JSON (từ 02/2025) |
+
+**Phương thức tích hợp (trước khi API chết):**
+
+```python
+import httpx
+r = httpx.get(
+    "https://pubpeer.com/v1/publications",
+    params={"doi": doi},
+    timeout=12.0,
+)
+# Kiểm tra response trước khi parse
+if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
+    data = r.json()
+    comments = data.get("total", 0)
+```
+
+**Cơ chế Fallback (hiện tại):**
+- **API trả 404 hoặc HTML** → `pubpeer_comments = 0`
+- Luôn cung cấp manual search URL: `https://pubpeer.com/search?q={doi}`
+- Log debug warning (không crash, không raise exception)
+- Kiểm tra cả HTTP status code VÀ `Content-Type` header trước khi parse JSON
+
+```mermaid
+flowchart LR
+    A[scan_doi] --> B[httpx GET<br/>pubpeer.com/v1/publications]
+    B --> C{status == 200<br/>AND json in<br/>Content-Type?}
+    C -->|Yes| D[Parse JSON<br/>count comments]
+    C -->|No ❌| E[pubpeer_comments = 0<br/>url = manual search link]
+    B -->|Exception| E
+
+    style E fill:#f39c12,stroke:#e67e22
+    style D fill:#2ecc71,stroke:#27ae60
+```
+
+### 7.6 HuggingFace Hub & Model Downloads
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Tải và cache ML models từ HuggingFace Model Hub |
+| **SDK** | `huggingface-hub` ≥ 0.20 |
+| **Auth** | `HF_TOKEN` (optional, cho private/gated models) |
+| **Sử dụng bởi** | `journal_finder.py` (SPECTER2, SciBERT), `ai_writing_detector.py` (RoBERTa) |
+| **Cache** | `~/.cache/huggingface/hub/` (auto-cached sau lần tải đầu) |
+| **Trạng thái** | ✅ Hoạt động |
+
+**Phương thức tích hợp:**
+
+```python
+import os
+from dotenv import load_dotenv
+load_dotenv()  # Load HF_TOKEN từ .env
+
+from huggingface_hub import login
+token = os.environ.get("HF_TOKEN", "").strip()
+if token:
+    login(token=token, add_to_git_credential=False)
+    # "HF_TOKEN is set and is the current active token"
+```
+
+**Cơ chế Fallback — Offline Mode:**
+```python
+# Thử online → nếu fail → thử local cache
+for model_name in MODEL_CANDIDATES:
+    try:
+        model = SentenceTransformer(model_name, local_files_only=False)
+        return model
+    except Exception:
+        try:
+            model = SentenceTransformer(model_name, local_files_only=True)
+            return model
+        except Exception:
+            continue
+# Nếu tất cả fail → TF-IDF fallback (không cần ML model)
+```
+
+### 7.7 SPECTER2 — Scientific Paper Embeddings
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Tạo sentence embeddings cho abstract → so sánh cosine similarity với journal scope |
+| **Model** | `allenai/specter2_base` (768 dimensions) |
+| **SDK** | `sentence-transformers` ≥ 2.2 |
+| **File** | `backend/app/services/tools/journal_finder.py` |
+| **Latency** | ~0.2s (cached) / ~3.9s (first load) |
+| **Trạng thái** | ✅ Hoạt động (cached locally) |
+
+**Phương thức tích hợp:**
+
+```python
+from sentence_transformers import SentenceTransformer
+
+# Model candidate chain (fallback tự động)
+MODEL_CANDIDATES = [
+    "allenai/specter2_base",                     # Tốt nhất cho scientific text
+    "allenai/scibert_scivocab_uncased",          # Backup 1
+    "sentence-transformers/all-MiniLM-L6-v2",   # Backup 2 (general-purpose)
+]
+
+model = SentenceTransformer("allenai/specter2_base")
+
+# Tạo embeddings
+query_embedding = model.encode(["abstract text"], convert_to_numpy=True)
+journal_embedding = model.encode(["journal scope text"], convert_to_numpy=True)
+
+# Cosine similarity
+similarity = np.dot(query_embedding, journal_embedding) / (
+    np.linalg.norm(query_embedding) * np.linalg.norm(journal_embedding)
+)
+```
+
+**Cơ chế Fallback (3 tầng):**
+
+```mermaid
+flowchart TD
+    A[Load SPECTER2<br/>allenai/specter2_base] -->|Success| B[✅ 768-dim embeddings]
+    A -->|Fail| C[Load SciBERT<br/>scibert_scivocab_uncased]
+    C -->|Success| B
+    C -->|Fail| D[Load MiniLM<br/>all-MiniLM-L6-v2]
+    D -->|Success| E[✅ 384-dim embeddings]
+    D -->|Fail| F[TF-IDF Fallback<br/>scikit-learn CountVectorizer]
+    F --> G[✅ Keyword matching<br/>không cần ML]
+
+    style B fill:#2ecc71,stroke:#27ae60
+    style E fill:#f39c12,stroke:#e67e22
+    style G fill:#e74c3c,stroke:#c0392b,color:#fff
+```
+
+### 7.8 RoBERTa — AI Writing Detection
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Phát hiện văn bản được tạo bởi AI (GPT-2 detector) |
+| **Model** | `roberta-base-openai-detector` (OpenAI GPT-2 Output Detector) |
+| **SDK** | `transformers` + `torch` (PyTorch CPU) |
+| **File** | `backend/app/services/tools/ai_writing_detector.py` |
+| **Ensemble** | 70% ML score + 30% rule-based score |
+| **Latency** | ~0.1s (cached) / ~4.8s (first load) |
+| **Trạng thái** | ✅ Hoạt động |
+
+**Phương thức tích hợp:**
+
+```python
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+# Load model
+tokenizer = AutoTokenizer.from_pretrained("roberta-base-openai-detector")
+model = AutoModelForSequenceClassification.from_pretrained("roberta-base-openai-detector")
+
+# Inference
+inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+with torch.no_grad():
+    logits = model(**inputs).logits
+    probs = torch.softmax(logits, dim=-1)
+    ai_prob = probs[0][0].item()  # P(AI-generated)
+
+# Ensemble: 70% ML + 30% rule-based
+final_score = 0.7 * ai_prob + 0.3 * rule_based_score
+```
+
+**Rule-based Features (7 chỉ số):**
+
+| # | Feature | Mô tả | Ngưỡng AI |
+|---|---------|--------|-----------|
+| 1 | TTR (Type-Token Ratio) | Đa dạng từ vựng | < 0.4 |
+| 2 | Hapax Ratio | Tỷ lệ từ xuất hiện 1 lần | < 0.3 |
+| 3 | Sentence Uniformity | Độ đồng đều chiều dài câu | > 0.85 |
+| 4 | AI Pattern Count | 30+ mẫu câu AI đặc trưng | ≥ 3 |
+| 5 | Filler Phrase Count | 20+ cụm từ "filler" | ≥ 2 |
+| 6 | Transition Word Density | Mật độ từ nối | > 15% |
+| 7 | Repetition Score | Cấu trúc câu lặp lại | > 0.3 |
+
+**Cơ chế Fallback:**
+- Nếu `transformers` / `torch` không cài → chỉ dùng rule-based (7 features)
+- Nếu model load fail → rule-based only, `method = "rule_based_heuristics"`
+- Verdict scale: LIKELY_HUMAN → POSSIBLY_HUMAN → UNCERTAIN → POSSIBLY_AI → LIKELY_AI
+
+### 7.9 PyMuPDF (fitz) — PDF Processing
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Trích xuất text từ file PDF để tóm tắt và phân tích |
+| **Package** | `PyMuPDF` (import name: `fitz`) |
+| **File** | `backend/app/services/file_service.py` |
+| **Input** | Binary PDF data (từ upload hoặc storage) |
+| **Trạng thái** | ✅ Hoạt động |
+
+**Phương thức tích hợp:**
+
+```python
+import fitz  # PyMuPDF
+from io import BytesIO
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=BytesIO(file_bytes), filetype="pdf")
+    text_parts = []
+    for page in doc:
+        text_parts.append(page.get_text())
+    doc.close()
+    return "\n".join(text_parts)
+```
+
+### 7.10 SQLAlchemy — ORM & Database
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | ORM cho database — quản lý users, sessions, messages, files |
+| **Version** | SQLAlchemy ≥ 2.0.30 (async-compatible) |
+| **Database** | SQLite (dev) / PostgreSQL (production) |
+| **Encryption** | Custom `EncryptedText` / `EncryptedJSON` types (AES-256-GCM) |
+| **File** | `backend/app/core/database.py`, `backend/app/core/encrypted_types.py` |
+| **Trạng thái** | ✅ Hoạt động |
+
+**Bảng dữ liệu:**
+
+| Table | Model | Mô tả |
+|-------|-------|--------|
+| `users` | `User` | Thông tin tài khoản, bcrypt password hash, role |
+| `chat_sessions` | `ChatSession` | Phiên chat, title, mode, user_id |
+| `chat_messages` | `ChatMessage` | Nội dung message, role, message_type, tool_payload |
+| `file_attachments` | `FileAttachment` | Metadata file upload, storage_key, extracted_text |
+
+**Composite Indexes (tối ưu performance):**
+```python
+# chat_messages: truy vấn messages theo session + thời gian
+Index("idx_chatmsg_session_created", "session_id", "created_at")
+
+# file_attachments: listing files theo session hoặc user
+Index("idx_fileatt_session_created", "session_id", "created_at")
+Index("idx_fileatt_user_created", "user_id", "created_at")
+```
+
+### 7.11 AWS S3 — Cloud Storage (boto3)
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Lưu trữ file upload trên cloud (production) |
+| **SDK** | `boto3` ≥ 1.28 |
+| **Auth** | AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) |
+| **Pattern** | Strategy pattern: `LocalStorage` ↔ `S3Storage` switchable |
+| **File** | `backend/app/services/storage_service.py` |
+| **Trạng thái** | ✅ Sẵn sàng (dev dùng LocalStorage) |
+
+**Phương thức tích hợp:**
+
+```python
+import boto3
+
+# S3Storage class
+class S3Storage:
+    def __init__(self):
+        self.client = boto3.client("s3",
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region,
+        )
+        self.bucket = settings.s3_bucket_name
+
+    def upload(self, key: str, data: bytes) -> str:
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
+        return key
+
+    def generate_presigned_url(self, key: str, expires: int = 3600) -> str:
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+```
+
+### 7.12 Authentication Libraries
+
+#### bcrypt — Password Hashing
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Hash mật khẩu user khi đăng ký, verify khi login |
+| **Algorithm** | bcrypt (adaptive cost factor) |
+| **File** | `backend/app/core/security.py` |
+
+```python
+import bcrypt
+
+# Hash password
+hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+# Verify password
+is_valid = bcrypt.checkpw(password.encode(), hashed)
+```
+
+#### python-jose — JWT Token Management
+
+| Thuộc tính | Chi tiết |
+|-----------|---------|
+| **Vai trò** | Tạo và xác thực JWT access tokens |
+| **Algorithm** | HS256 (HMAC-SHA256) |
+| **Claims** | `sub` (user_id), `role`, `iat` (issued-at), `jti` (unique ID), `exp` (1h TTL) |
+| **File** | `backend/app/core/security.py` |
+
+```python
+from jose import jwt
+import uuid
+from datetime import datetime, timezone, timedelta
+
+# Tạo token
+payload = {
+    "sub": str(user.id),
+    "role": user.role,
+    "iat": datetime.now(timezone.utc),
+    "jti": str(uuid.uuid4()),
+    "exp": datetime.now(timezone.utc) + timedelta(minutes=60),
+}
+token = jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
+
+# Verify token
+decoded = jwt.decode(token, settings.jwt_secret_key, algorithms=["HS256"])
+```
+
+### 7.13 Bảng tổng hợp trạng thái tích hợp
+
+| # | Service | Type | SDK/Client | Fallback | Status | Latency |
+|---|---------|------|-----------|----------|--------|---------|
+| 1 | Google Gemini | LLM API | `google-genai` | Default messages | ✅ OK | ~1.2s |
+| 2 | OpenAlex | REST API | `pyalex` + `httpx` | SDK → HTTP → UNVERIFIED | ✅ OK | ~2.0s |
+| 3 | Crossref | REST API | `habanero` + `httpx` | SDK → HTTP → UNVERIFIED | ✅ OK | ~1.0s |
+| 4 | PubPeer | REST API | `httpx` | Graceful degrade → 0 comments | ❌ DEAD | N/A |
+| 5 | HuggingFace Hub | Model Repo | `huggingface-hub` | Online → Local cache | ✅ OK | — |
+| 6 | SPECTER2 | ML Model | `sentence-transformers` | specter2 → scibert → MiniLM → TF-IDF | ✅ OK | ~0.2s |
+| 7 | RoBERTa | ML Model | `transformers` + `torch` | ML → Rule-based only | ✅ OK | ~0.1s |
+| 8 | PyMuPDF | Library | `fitz` | — (required) | ✅ OK | <0.1s |
+| 9 | SQLAlchemy | ORM | `sqlalchemy` | — (required) | ✅ OK | <0.01s |
+| 10 | AWS S3 | Cloud Storage | `boto3` | LocalStorage fallback | ✅ Ready | — |
+| 11 | bcrypt | Library | `bcrypt` | — (required) | ✅ OK | <0.01s |
+| 12 | python-jose | Library | `jose` | — (required) | ✅ OK | <0.01s |
+| 13 | PyCryptodome | Library | `Crypto` | — (required) | ✅ OK | <0.01s |
+
+### 7.14 Sequence Diagram — Luồng xác minh Citation với fallback chain
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI Endpoint
+    participant CC as CitationChecker
+    participant CR as Crossref (habanero)
+    participant CR2 as Crossref (httpx)
+    participant OA as OpenAlex (pyalex)
+    participant OA2 as OpenAlex (httpx)
+
+    U->>API: POST /tools/verify-citation<br/>{text: "...doi:10.1038/nature12373"}
+    API->>CC: verify(text)
+    CC->>CC: extract_citations(text)<br/>6 regex patterns
+
+    Note over CC: DOI found → verify via Crossref
+    CC->>CR: cr.works(ids=doi)
+    alt Habanero Success
+        CR-->>CC: metadata (title, authors, DOI)
+        CC->>CC: status = DOI_VERIFIED
+    else Habanero Fail
+        CR-->>CC: Exception
+        CC->>CR2: httpx.get(api.crossref.org/works/{doi})
+        alt httpx Success
+            CR2-->>CC: JSON response
+            CC->>CC: status = DOI_VERIFIED
+        else httpx Fail
+            CR2-->>CC: Exception
+            Note over CC: Chuyển sang OpenAlex
+        end
+    end
+
+    Note over CC: Title-based verification
+    CC->>OA: Works().search(title).get()
+    alt PyAlex Success
+        OA-->>CC: matching works
+        CC->>CC: fuzzy match authors (SequenceMatcher)
+    else PyAlex Fail
+        OA-->>CC: Exception
+        CC->>OA2: httpx.get(api.openalex.org/works)
+        OA2-->>CC: results
+    end
+
+    CC-->>API: [CitationCheckResult]
+    API->>API: CitationItem(**asdict(result))
+    API-->>U: CitationReportResponse
+```
+
+### 7.15 Sequence Diagram — Luồng Retraction Scan đa nguồn
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI Endpoint
+    participant RS as RetractionScanner
+    participant CR as Crossref
+    participant OA as OpenAlex
+    participant PP as PubPeer ❌
+
+    U->>API: POST /tools/retraction-scan<br/>{text: "10.1016/S0140-6736(97)11096-0"}
+    API->>RS: scan(text)
+    RS->>RS: Trích xuất DOIs bằng regex
+
+    loop Cho mỗi DOI
+        Note over RS: Source 1: Crossref
+        RS->>CR: cr.works(ids=doi)
+        CR-->>RS: metadata + update-to field
+        RS->>RS: Kiểm tra update-to retraction/correction
+        RS->>RS: Kiểm tra title prefix "RETRACTED:"
+
+        Note over RS: Source 2: OpenAlex
+        RS->>OA: httpx.get(openalex/works/{doi})
+        OA-->>RS: {is_retracted: true/false}
+
+        Note over RS: Source 3: PubPeer (DEAD)
+        RS->>PP: httpx.get(pubpeer/v1/publications)
+        PP-->>RS: 404 HTML ❌
+        RS->>RS: pubpeer_comments = 0<br/>pubpeer_url = manual search link
+
+        RS->>RS: Tính risk_level<br/>(CRITICAL/HIGH/MEDIUM/LOW/NONE)
+    end
+
+    RS-->>API: [RetractionResult]
+    API->>API: RetractionItem(**asdict(result))
+    API-->>U: RetractionScanResponse
 ```
 
 ---
