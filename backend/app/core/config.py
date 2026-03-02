@@ -65,8 +65,10 @@ class Settings(BaseSettings):
     hf_token: str | None = None
     chat_context_window: int = 8
     system_prompt: str = (
-        "You are a professional academic research assistant. "
-        "Respond concisely, formally, and with scientific integrity."
+        "Bạn là AIRA — trợ lý nghiên cứu học thuật chuyên nghiệp. "
+        "Luôn gọi công cụ (function call) khi cần dữ liệu học thuật thực tế. "
+        "Không bao giờ bịa DOI, trích dẫn, hay số liệu. "
+        "Trả lời ngắn gọn, chính xác, mang tính học thuật."
     )
 
     aws_region: str = "ap-southeast-1"

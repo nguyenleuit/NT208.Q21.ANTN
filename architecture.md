@@ -207,7 +207,7 @@ graph LR
 | Service | File | Chức năng |
 |---------|------|-----------|
 | **ChatService** | `services/chat_service.py` | Orchestration: tạo session, lưu message, gọi LLM/tools theo mode, auto-detect title |
-| **LLMService** (GeminiService) | `services/llm_service.py` | Wrapper Google Gemini: `generate_response()`, `summarize_text()` — dùng `google-genai` SDK |
+| **LLMService** (GeminiService) | `services/llm_service.py` | Wrapper Google Gemini với **Function Calling**: `generate_response()` (FC loop + 4 tools), `summarize_text()`, `generate_simple()` — dùng `google-genai` SDK |
 | **FileService** | `services/file_service.py` | Upload workflow: validate → encrypt → store → extract text (PDF via PyMuPDF) |
 | **StorageService** | `services/storage_service.py` | Dual-backend abstraction: Local FS hoặc AWS S3, AES-256-GCM encryption, pre-signed URLs |
 | **CryptoManager** | `core/crypto.py` | Master key management, AES-256-GCM encrypt/decrypt cho files và DB columns |
@@ -1043,10 +1043,17 @@ sequenceDiagram
 
     alt mode == GENERAL_QA
         ChatSvc->>LLM: generate_response(history, user_text)
-        LLM->>LLM: _build_prompt(history + system_instruction)
-        LLM->>Gemini: models.generate_content(model, contents, config)
-        Gemini-->>LLM: Generated text
-        LLM-->>ChatSvc: AI response text
+        LLM->>LLM: _build_contents(history → Content objects)
+        LLM->>Gemini: generate_content(contents, tools=[4 functions], AFC=disabled)
+        alt Gemini returns function_call
+            Gemini-->>LLM: function_call: scan_retraction_and_pubpeer(text)
+            LLM->>LLM: Execute tool locally → get real data
+            LLM->>Gemini: function_response(name, result)
+            Gemini-->>LLM: Final text (grounded in tool data)
+        else Gemini returns text directly
+            Gemini-->>LLM: Generated text (no tool needed)
+        end
+        LLM-->>ChatSvc: FunctionCallingResponse(text, message_type, tool_results)
     end
 
     ChatSvc->>DB: INSERT chat_messages (role=ASSISTANT)
@@ -1454,7 +1461,7 @@ graph TB
     end
 
     subgraph External_APIs["🌐 External APIs"]
-        GEMINI["Google Gemini API<br/>gemini-2.0-flash"]
+        GEMINI["Google Gemini API<br/>gemini-flash-latest<br/>+ Function Calling"]
         OA["OpenAlex API<br/>api.openalex.org"]
         CR["Crossref API<br/>api.crossref.org"]
         PP["PubPeer API v3<br/>pubpeer.com/v3"]
@@ -1503,18 +1510,70 @@ graph TB
     class DB,S3,CRYPTO,JWT_LIB,BCRYPT,PDF ok
 ```
 
-### 7.2 Google Gemini API
+### 7.2 Google Gemini API — Function Calling Architecture
 
 | Thuộc tính | Chi tiết |
 |-----------|---------|
-| **Vai trò** | LLM chính — tạo phản hồi chat, tóm tắt PDF, hỗ trợ viết bài |
-| **SDK** | `google-genai` ≥ 1.0.0 (phiên bản mới, thay thế deprecated `google-generativeai`) |
-| **Model** | `gemini-2.0-flash` (cấu hình qua `settings.gemini_model`) |
+| **Vai trò** | LLM chính — tạo phản hồi chat, **gọi tool tự động qua Function Calling**, tóm tắt PDF |
+| **SDK** | `google-genai` ≥ 1.0.0 (thay thế deprecated `google-generativeai`) |
+| **Model** | `gemini-flash-latest` (cấu hình qua `settings.gemini_model`) |
 | **Auth** | API Key qua biến môi trường `GOOGLE_API_KEY` |
 | **File** | `backend/app/services/llm_service.py` |
-| **Trạng thái** | ✅ Hoạt động (429 khi hết quota — hành vi bình thường) |
+| **Function Calling** | ✅ 4 tool functions registered, manual FC loop (AFC disabled) |
+| **System Prompt** | Vietnamese anti-hallucination prompt (SYSTEM_PROMPT constant, 955 chars) |
+| **Trạng thái** | ✅ Hoạt động — tool calls verified end-to-end |
 
-**Phương thức tích hợp:**
+#### 7.2.1 Function Calling — Tổng quan
+
+Gemini **không bao giờ tự bịa dữ liệu học thuật**. Thay vào đó, khi user hỏi về retraction, citation, journal, hoặc AI detection, Gemini sẽ tự động gọi tool functions thực thi ở backend, nhận kết quả thực, rồi tổng hợp câu trả lời dựa trên dữ liệu đó.
+
+**4 Tool Functions đã đăng ký:**
+
+| Tên Function | Mô tả | Backend Tool |
+|-------------|-------|-------------|
+| `scan_retraction_and_pubpeer(text)` | Quét DOI → retraction status, PubPeer comments, risk level | `retraction_scanner.scan()` |
+| `verify_citation(text)` | Xác minh citation qua OpenAlex + Crossref | `citation_checker.verify()` |
+| `match_journal(abstract, title)` | Tìm journal phù hợp bằng SPECTER2 embedding | `journal_finder.recommend()` |
+| `detect_ai_writing(text)` | Phát hiện AI viết bằng RoBERTa ensemble | `ai_writing_detector.analyze()` |
+
+#### 7.2.2 Function Calling Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant CS as ChatService
+    participant GS as GeminiService
+    participant G as Gemini API
+    participant T as Tool Functions
+    participant DB as Database
+
+    U->>CS: "Check DOI 10.1007/... for retraction"
+    CS->>CS: Load history (chat_context_window=8)
+    CS->>GS: generate_response(history, user_text)
+    GS->>GS: _build_contents(history, user_text)
+    GS->>G: generate_content(contents, tools=[4 functions], AFC=disabled)
+
+    Note over G: Gemini phân tích prompt<br/>→ quyết định gọi tool
+
+    G-->>GS: Response with function_call:<br/>scan_retraction_and_pubpeer(text="10.1007/...")
+
+    rect rgb(255, 243, 224)
+        Note over GS,T: FC Loop — Iteration 1
+        GS->>T: scan_retraction_and_pubpeer(text)
+        T->>T: retraction_scanner.scan(text)
+        Note over T: Crossref → OpenAlex → PubPeer v3 POST
+        T-->>GS: {results: [...], summary: {...}}
+        GS->>G: function_response(name, response=result)
+    end
+
+    G-->>GS: Final text response (grounded in tool data)
+    GS-->>CS: FunctionCallingResponse(text, tool_calls, message_type, tool_results)
+
+    CS->>DB: Save assistant message<br/>message_type=RETRACTION_REPORT<br/>tool_results={type, data}
+    CS-->>U: Rich tool result card + synthesised text
+```
+
+#### 7.2.3 Phương thức tích hợp
 
 ```python
 from google import genai
@@ -1523,39 +1582,101 @@ from google.genai import types as genai_types
 # Khởi tạo client
 client = genai.Client(api_key=settings.google_api_key)
 
-# Gọi API
-response = client.models.generate_content(
-    model=settings.gemini_model,  # "gemini-2.0-flash"
-    contents=prompt,
-    config=genai_types.GenerateContentConfig(
-        temperature=0.7,
-        max_output_tokens=2048,
+# Tool functions — Python callables with docstrings
+def scan_retraction_and_pubpeer(text: str) -> dict:
+    """Scan DOIs for retraction status and PubPeer comments."""
+    results = retraction_scanner.scan(text)
+    return {"results": [...], "summary": {...}}
+
+# FC loop (AFC disabled — manual control)
+config = genai_types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    tools=[scan_retraction_and_pubpeer, verify_citation,
+           match_journal, detect_ai_writing],
+    automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+        disable=True,  # Manual loop for tracking & error handling
     ),
 )
+
+response = client.models.generate_content(
+    model="gemini-flash-latest",
+    contents=contents,  # Multi-turn Content objects
+    config=config,
+)
+
+# Check for function_call in response
+for part in response.candidates[0].content.parts:
+    if part.function_call:
+        result = _execute_function_call(part.function_call)
+        # Send function_response back → Gemini synthesises final answer
 ```
 
-**Cơ chế Fallback:**
-- Nếu `GOOGLE_API_KEY` không được set → log warning, disable Gemini, trả message mặc định
-- Nếu SDK `google-genai` không cài → disable Gemini
-- Nếu API call thất bại (network, quota) → trả message lỗi thân thiện, KHÔNG crash
-- `summarize_text()` fallback: cắt 500 ký tự đầu kèm `[...]` khi Gemini disabled
+#### 7.2.4 FC Loop Architecture
 
 ```mermaid
 flowchart TD
-    A[User gửi message] --> B{GOOGLE_API_KEY<br/>có set?}
-    B -->|Không| C[Return message mặc định:<br/>'Gemini is not configured...']
-    B -->|Có| D{google-genai<br/>installed?}
-    D -->|Không| C
-    D -->|Có| E[genai.Client.models.generate_content]
-    E -->|Success| F[Return AI response]
-    E -->|Error 429| G[Return: 'Quota exceeded...']
-    E -->|Network Error| H[Return: 'Xin lỗi, tôi chưa thể trả lời...']
+    A[User Prompt + History] --> B[Build Contents<br/>Multi-turn Content objects]
+    B --> C[generate_content<br/>with tools + AFC disabled]
+    C --> D{Response has<br/>function_call?}
 
-    style C fill:#f39c12,stroke:#e67e22
-    style G fill:#ff6b6b,stroke:#c0392b
-    style H fill:#ff6b6b,stroke:#c0392b
-    style F fill:#2ecc71,stroke:#27ae60
+    D -->|Yes| E[Execute function locally]
+    E --> F[Append model response<br/>+ function_response to contents]
+    F --> G{Iteration < 5?}
+    G -->|Yes| C
+    G -->|No| H[Return budget-exceeded message]
+
+    D -->|No| I[Extract final text]
+    I --> J{Any tools<br/>called earlier?}
+    J -->|Yes| K[Build FunctionCallingResponse<br/>with message_type + tool_results]
+    J -->|No| L[Build FunctionCallingResponse<br/>message_type=TEXT]
+    K --> M[Return to ChatService]
+    L --> M
+
+    style E fill:#3498db,stroke:#2980b9,color:#fff
+    style K fill:#2ecc71,stroke:#27ae60
+    style L fill:#95a5a6,stroke:#7f8c8d
+    style H fill:#e74c3c,stroke:#c0392b,color:#fff
 ```
+
+#### 7.2.5 System Prompt (Anti-Hallucination)
+
+```
+Bạn là AIRA — trợ lý nghiên cứu học thuật chuyên nghiệp.
+
+### QUY TẮC BẮT BUỘC:
+1. KHÔNG BAO GIỜ bịa dữ liệu học thuật (DOI, citation, journal, PubPeer...)
+2. LUÔN gọi tool khi cần dữ liệu thực:
+   - Retraction/PubPeer → scan_retraction_and_pubpeer
+   - Citation → verify_citation
+   - Journal matching → match_journal
+   - AI detection → detect_ai_writing
+3. Nếu không có tool phù hợp → ghi rõ "kiến thức chung, chưa xác minh"
+4. Kết quả tool = DỮ LIỆU THỰC — trình bày chính xác
+5. Trả lời tiếng Việt (trừ khi user viết tiếng Anh)
+6. Ngắn gọn, chính xác, học thuật
+```
+
+#### 7.2.6 Cơ chế Fallback
+
+- Nếu `GOOGLE_API_KEY` không set → log warning, disable Gemini, trả message mặc định
+- Nếu SDK `google-genai` không cài → disable Gemini
+- Nếu tool execution fail → trả `{"error": "..."}` → Gemini nhận lỗi, thông báo cho user
+- Nếu FC loop vượt 5 iterations → trả budget-exceeded message
+- Nếu API call thất bại (network, quota) → trả message lỗi thân thiện, KHÔNG crash
+- `summarize_text()` sử dụng `generate_simple()` (không có tools) với fallback cắt text
+
+#### 7.2.7 FunctionCallingResponse Dataclass
+
+```python
+@dataclass
+class FunctionCallingResponse:
+    text: str                            # Final synthesised answer
+    tool_calls: list[dict] = []          # [{name, args, result}, ...]
+    message_type: str = "text"           # "retraction_report" | "citation_report" | ...
+    tool_results: dict | None = None     # {type: "...", data: [...]} for frontend rendering
+```
+
+`ChatService` sử dụng `message_type` và `tool_results` để lưu tin nhắn với đúng `MessageType` enum → frontend render rich tool-result components (JournalListCard, CitationReportCard, etc.).
 
 ### 7.3 OpenAlex API
 

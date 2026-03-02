@@ -159,7 +159,7 @@ class ChatService:
             )
             return user_msg, assistant_msg
 
-        # General Q&A mode with contextual memory
+        # General Q&A mode with contextual memory + Function Calling
         history = (
             db.query(ChatMessage)
             .filter(ChatMessage.session_id == session_id)
@@ -169,14 +169,23 @@ class ChatService:
         )
         history = list(reversed(history))
         user_message_with_context = self._build_file_context(db, session_id, user_message)
-        assistant_text = gemini_service.generate_response(history=history, user_text=user_message_with_context)
+        fc_response = gemini_service.generate_response(
+            history=history, user_text=user_message_with_context,
+        )
+
+        # Determine MessageType from function calling result
+        try:
+            msg_type = MessageType(fc_response.message_type)
+        except (ValueError, KeyError):
+            msg_type = MessageType.TEXT
 
         assistant_msg = self._save_message(
             db=db,
             session_id=session_id,
             role=MessageRole.ASSISTANT,
-            content=assistant_text,
-            message_type=MessageType.TEXT,
+            content=fc_response.text,
+            message_type=msg_type,
+            tool_results=fc_response.tool_results,
         )
         return user_msg, assistant_msg
 
