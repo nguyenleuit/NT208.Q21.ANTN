@@ -333,8 +333,18 @@ class GeminiService:
                     contents=contents,
                     config=config,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Gemini generate_content failed (iter %d).", iteration)
+                # Provide a more informative error message
+                err_msg = str(exc).lower()
+                if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                    return FunctionCallingResponse(
+                        text=(
+                            "⚠️ Gemini API đã hết quota (giới hạn miễn phí). "
+                            "Vui lòng thử lại sau vài phút hoặc nâng cấp plan. "
+                            "Tin nhắn của bạn đã được lưu."
+                        ),
+                    )
                 return FunctionCallingResponse(
                     text="Xin lỗi, đã xảy ra lỗi khi gọi Gemini. Vui lòng thử lại sau.",
                 )

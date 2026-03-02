@@ -90,6 +90,12 @@ export function ChatView() {
   if (!activeSessionId && messages.length === 0) {
     return (
       <div className="flex flex-col h-full">
+        {/* Mode selector visible even before session is created */}
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border dark:border-dark-border bg-surface/80 dark:bg-dark-surface/80 backdrop-blur-sm">
+          <div className="flex items-center gap-2">
+            <ModeSelector />
+          </div>
+        </div>
         <div className="flex-1 flex flex-col items-center justify-center px-4">
           <div className="w-14 h-14 rounded-2xl bg-accent/10 dark:bg-dark-accent/10 flex items-center justify-center mb-5">
             <Sparkles className="w-7 h-7 text-accent dark:text-dark-accent" />

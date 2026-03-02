@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # Model names are provider-managed and may change. Use ListModels if 404 occurs.
     gemini_model: str = "gemini-flash-latest"
 
+    @model_validator(mode="after")
+    def _normalize_optional_keys(self) -> "Settings":
+        """Treat empty strings as None for optional API keys."""
+        if isinstance(self.google_api_key, str) and not self.google_api_key.strip():
+            object.__setattr__(self, "google_api_key", None)
+        if isinstance(self.hf_token, str) and not self.hf_token.strip():
+            object.__setattr__(self, "hf_token", None)
+        return self
+
     # Hugging Face token for authenticated model downloads (optional)
     hf_token: str | None = None
     chat_context_window: int = 8

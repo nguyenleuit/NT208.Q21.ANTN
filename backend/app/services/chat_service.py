@@ -12,6 +12,7 @@ from app.models.chat_session import ChatSession, SessionMode
 from app.models.file_attachment import FileAttachment
 from app.models.user import User
 from app.services.llm_service import gemini_service
+from app.services.tools.ai_writing_detector import ai_writing_detector
 from app.services.tools.citation_checker import citation_checker
 from app.services.tools.journal_finder import journal_finder
 from app.services.tools.retraction_scan import retraction_scanner
@@ -97,6 +98,18 @@ class ChatService:
             summary = "I recommended journals based on abstract-topic similarity."
             return MessageType.JOURNAL_LIST, summary, {"type": "journal_list", "data": journals}
 
+        if mode == SessionMode.RETRACTION:
+            retraction = [asdict(item) for item in retraction_scanner.scan(text)]
+            summary = "Retraction scan completed on detected DOI(s)."
+            return MessageType.RETRACTION_REPORT, summary, {"type": "retraction_report", "data": retraction}
+
+        if mode == SessionMode.AI_DETECTION:
+            result = ai_writing_detector.analyze(text)
+            data = asdict(result)
+            summary = f"AI writing detection: score={data['score']}, verdict={data['verdict']}."
+            return MessageType.AI_WRITING_DETECTION, summary, {"type": "ai_writing_detection", "data": data}
+
+        # Fallback (should not reach here)
         retraction = [asdict(item) for item in retraction_scanner.scan(text)]
         summary = "Retraction scan completed on detected DOI(s)."
         return MessageType.RETRACTION_REPORT, summary, {"type": "retraction_report", "data": retraction}
@@ -147,7 +160,12 @@ class ChatService:
         )
 
         mode = session_obj.mode
-        if mode in {SessionMode.VERIFICATION, SessionMode.JOURNAL_MATCH}:
+        if mode in {
+            SessionMode.VERIFICATION,
+            SessionMode.JOURNAL_MATCH,
+            SessionMode.RETRACTION,
+            SessionMode.AI_DETECTION,
+        }:
             msg_type, content, structured = self._run_mode_tool(mode, user_message)
             assistant_msg = self._save_message(
                 db=db,

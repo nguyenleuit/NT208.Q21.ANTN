@@ -12,6 +12,8 @@ class SessionMode(str, Enum):
     GENERAL_QA = "general_qa"
     VERIFICATION = "verification"
     JOURNAL_MATCH = "journal_match"
+    RETRACTION = "retraction"
+    AI_DETECTION = "ai_detection"
 
 
 class ChatSession(Base):

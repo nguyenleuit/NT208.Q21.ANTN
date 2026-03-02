@@ -8,6 +8,8 @@ const MODE_LABELS: Record<Session["mode"], string> = {
   general_qa: "General Chat",
   verification: "Citation Check",
   journal_match: "Journal Match",
+  retraction: "Retraction Scan",
+  ai_detection: "AI Detection",
 };
 
 export function ModeSelector() {

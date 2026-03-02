@@ -160,8 +160,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         };
         dispatch({ type: "ADD_MESSAGES", messages: [optimisticMsg] });
 
-        // Send to backend
-        await api.sendChat(token, sessionId, text);
+        // Send to backend (include mode so backend routes to correct tool)
+        await api.sendChat(token, sessionId, text, state.mode);
 
         // Replace optimistic message with real messages
         const realMessages = await api.listMessages(token, sessionId);

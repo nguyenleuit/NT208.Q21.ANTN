@@ -159,12 +159,12 @@ export const api = {
     return request<Message[]>(`/api/v1/sessions/${sessionId}/messages`, {}, token);
   },
 
-  async sendChat(token: string, sessionId: string, userMessage: string): Promise<ChatCompletionResponse> {
+  async sendChat(token: string, sessionId: string, userMessage: string, mode?: string): Promise<ChatCompletionResponse> {
     return request<ChatCompletionResponse>(
       `/api/v1/chat/${sessionId}`,
       {
         method: "POST",
-        body: JSON.stringify({ user_message: userMessage }),
+        body: JSON.stringify({ user_message: userMessage, mode: mode || undefined }),
       },
       token,
     );

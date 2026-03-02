@@ -11,7 +11,7 @@ export interface User {
 export interface Session {
   id: string;
   title: string;
-  mode: "general_qa" | "verification" | "journal_match";
+  mode: "general_qa" | "verification" | "journal_match" | "retraction" | "ai_detection";
   created_at: string;
   updated_at: string;
 }
